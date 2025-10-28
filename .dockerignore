@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Environment Variables (will be set via Railway/Docker)
+.env
+.env.local
+.env.production
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Testing
+.pytest_cache/
+.coverage
+tests/
+
+# Logs
+*.log
+
+# Temporary generated files (will be created at runtime)
+ghsl_brain/temp_generated/
+ghsl_brain/generated_formats/
+ghsl_brain/missing_words/*.json
+ghsl_brain/missing_words/*.csv
+
+# Documentation (not needed in container)
+*.md
+!README.md
+
+# Git
+.git/
+.gitignore

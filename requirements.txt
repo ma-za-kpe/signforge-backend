@@ -1,0 +1,46 @@
+# Core FastAPI
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.6
+pydantic-settings==2.7.0
+
+# AI/ML Libraries (minimal for search only)
+sentence-transformers==3.3.1
+torch==2.6.0
+faiss-cpu==1.9.0.post1
+
+# PDF Processing (for auto-extraction)
+PyMuPDF==1.24.0
+Pillow==10.4.0
+
+# Utilities
+python-dotenv>=0.21.0
+
+# Format Creator & Analytics
+qrcode==8.0
+gtts==2.5.4
+reportlab==4.2.5
+streamlit==1.41.1
+plotly==5.24.1
+pandas==2.2.3
+
+# Rural Delivery (optional - for production)
+# twilio>=8.0.0  # WhatsApp integration (uncomment when needed)
+requests>=2.31.0  # For API calls and URL shortening
+
+# Development & Testing
+pytest==8.3.4
+pytest-cov==6.0.0
+pytest-asyncio==0.25.2
+httpx==0.28.1
+colorama==0.4.6
+
+# Code Quality
+black==24.10.0
+flake8==7.1.1
+flake8-docstrings==1.7.0
+flake8-bugbear==24.10.31
+mypy==1.14.0
+isort==5.13.2
+pylint==3.3.3
