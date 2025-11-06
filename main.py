@@ -8,21 +8,66 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from analytics_dashboard import get_dashboard
+# Try to import dashboard (optional - requires streamlit)
+try:
+    from analytics_dashboard import get_dashboard
+    DASHBOARD_AVAILABLE = True
+except ImportError:
+    DASHBOARD_AVAILABLE = False
+    print("⚠ Analytics dashboard not available")
 
-# Import format creator and analytics
-from format_creator import get_format_creator
+# Try to import database (optional)
+try:
+    from database import get_db, init_db, Word, Contribution
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+    print("⚠ Database not available")
+
+# Try to import format creator (optional - requires qrcode, gtts, reportlab)
+try:
+    from format_creator import get_format_creator
+    FORMAT_CREATOR_AVAILABLE = True
+except ImportError:
+    FORMAT_CREATOR_AVAILABLE = False
+    print("⚠ Format creator not available")
+
+# Import contribution system (optional - gracefully handle if not available)
+contribution_router = None
+try:
+    from contribution_api import router as contribution_router
+    print("✓ Contribution system loaded")
+except ImportError as e:
+    print(f"⚠ Contribution system not available: {e}")
+
+# Import training queue system (optional)
+training_router = None
+try:
+    from training_queue import router as training_router
+    print("✓ Training queue system loaded")
+except ImportError as e:
+    print(f"⚠ Training queue system not available: {e}")
 
 app = FastAPI(
     title="Ghana Sign Language API",
     description="AI-powered sign language search and format generation",
     version="1.0.0",
 )
+
+# Initialize database on startup (optional)
+@app.on_event("startup")
+async def startup_event():
+    if DB_AVAILABLE:
+        try:
+            init_db()
+            print("✓ Database initialized")
+        except Exception as e:
+            print(f"⚠ Database initialization failed: {e}")
 
 # CORS configuration for Next.js frontend
 # Using allow_origin_regex to match all Vercel deployment URLs
@@ -57,6 +102,20 @@ if (BRAIN_DIR / "sign_images").exists():
 from task_queue import start_background_worker
 
 start_background_worker(BRAIN_DIR)
+
+# Mount contribution system router (if available)
+if contribution_router:
+    app.include_router(contribution_router)
+    print("✓ Contribution routes mounted")
+else:
+    print("⚠ Contribution routes not available")
+
+# Mount training queue router (if available)
+if training_router:
+    app.include_router(training_router)
+    print("✓ Training queue routes mounted")
+else:
+    print("⚠ Training queue routes not available")
 
 
 # Models
@@ -138,6 +197,83 @@ async def health():
         "version": "1.0.0",
         "brain_loaded": brain_exists,
         "total_signs": total_signs,
+    }
+
+
+@app.get("/api/dictionary-words")
+async def get_dictionary_words(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=100),
+):
+    """Get paginated list of dictionary words with contribution status"""
+    if DB_AVAILABLE:
+        try:
+            # Try database first
+            db = next(get_db())
+            offset = (page - 1) * per_page
+            words = db.query(Word).order_by(
+                Word.is_complete.asc(),
+                Word.contributions_count.desc()
+            ).offset(offset).limit(per_page).all()
+
+            total_count = db.query(Word).count()
+            db.close()
+
+            return {
+                "words": [
+                    {
+                        "word": w.word,
+                        "contributions": w.contributions_count,
+                        "needed": w.contributions_needed,
+                        "ready": w.is_complete,
+                        "quality_score": w.quality_score
+                    }
+                    for w in words
+                ],
+                "total": total_count,
+                "page": page,
+                "per_page": per_page,
+                "total_pages": (total_count + per_page - 1) // per_page
+            }
+        except Exception:
+            pass  # Fall through to file-based fallback
+
+    # Fallback: load from terms.json
+    import json
+    terms_file = BRAIN_DIR / "terms.json"
+    if not terms_file.exists():
+        raise HTTPException(status_code=404, detail="Dictionary not found")
+
+    with open(terms_file, "r", encoding="utf-8") as f:
+        terms = json.load(f)
+
+    # terms.json is a dict with numeric keys, extract "word" field from values
+    if isinstance(terms, dict):
+        words = sorted([data['word'].upper() for data in terms.values() if 'word' in data])
+    else:
+        words = sorted([term.upper() for term in terms])
+
+    total_count = len(words)
+
+    # Paginate
+    offset = (page - 1) * per_page
+    page_words = words[offset:offset + per_page]
+
+    return {
+        "words": [
+            {
+                "word": w,
+                "contributions": 0,
+                "needed": 50,
+                "ready": False,
+                "quality_score": None
+            }
+            for w in page_words
+        ],
+        "total": total_count,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": (total_count + per_page - 1) // per_page
     }
 
 
@@ -224,8 +360,9 @@ async def search_sign(q: str = Query(..., description="Search query (English wor
             confidence = top_result["confidence"]
 
         # Log search to analytics
-        dashboard = get_dashboard(BRAIN_DIR)
-        dashboard.log_search(q, found=True, confidence=confidence)
+        if DASHBOARD_AVAILABLE:
+            dashboard = get_dashboard(BRAIN_DIR)
+            dashboard.log_search(q, found=True, confidence=confidence)
 
         return {
             "word": q,
@@ -249,7 +386,7 @@ async def search_sign(q: str = Query(..., description="Search query (English wor
 
     except HTTPException as e:
         # Log failed searches to analytics
-        if e.status_code == 404:
+        if e.status_code == 404 and DASHBOARD_AVAILABLE:
             dashboard = get_dashboard(BRAIN_DIR)
             dashboard.log_search(q, found=False, confidence=0.0)
 
@@ -531,24 +668,32 @@ class FlagRequest(BaseModel):
 
 
 @app.post("/api/corrections/flag")
-async def flag_result(request: FlagRequest):
+async def flag_result(request_data: FlagRequest, request: Request):
     """
     Flag a search result as correct or incorrect
 
     This enables the human-in-the-loop learning system.
     Users can report when results are wrong and suggest corrections.
+
+    SECURITY: Now tracks IP address and user agent for abuse prevention
     """
     from correction_service import get_correction_service
+
+    # Capture user context for security
+    ip_address = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
 
     correction_service = get_correction_service(BRAIN_DIR)
 
     feedback = correction_service.flag_result(
-        query=request.query,
-        returned_word=request.returned_word,
-        correct_word=request.correct_word,
-        is_correct=request.is_correct,
-        user_comment=request.user_comment,
-        confidence_score=request.confidence_score,
+        query=request_data.query,
+        returned_word=request_data.returned_word,
+        correct_word=request_data.correct_word,
+        is_correct=request_data.is_correct,
+        user_comment=request_data.user_comment,
+        confidence_score=request_data.confidence_score,
+        ip_address=ip_address,  # NEW: Security tracking
+        user_agent=user_agent,  # NEW: Security tracking
     )
 
     return {
@@ -865,11 +1010,11 @@ async def create_lesson_bundle(request: LessonBundleRequest):
         bundle = creator.create_lesson_bundle(request.words, request.lesson_title)
 
         # Log lesson creation and format generation to analytics
-        dashboard = get_dashboard(BRAIN_DIR)
-        dashboard.log_lesson_creation(request.lesson_title, len(request.words))
-
-        for word in request.words:
-            dashboard.log_format_generation(word, ["qr", "audio", "haptic", "pdf"])
+        if DASHBOARD_AVAILABLE:
+            dashboard = get_dashboard(BRAIN_DIR)
+            dashboard.log_lesson_creation(request.lesson_title, len(request.words))
+            for word in request.words:
+                dashboard.log_format_generation(word, ["qr", "audio", "haptic", "pdf"])
 
         return {
             "success": True,
@@ -941,6 +1086,9 @@ async def get_metrics():
 
     Used by the Streamlit analytics dashboard
     """
+    if not DASHBOARD_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Analytics dashboard not available")
+
     dashboard = get_dashboard(BRAIN_DIR)
     metrics = dashboard.get_metrics()
     format_stats = dashboard.get_format_stats()
@@ -961,10 +1109,161 @@ async def update_metrics(updates: dict):
     Allows external systems to update analytics metrics
     Useful for tracking offline usage, rural delivery, etc.
     """
+    if not DASHBOARD_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Analytics dashboard not available")
+
     dashboard = get_dashboard(BRAIN_DIR)
     dashboard.update_metrics(updates)
 
     return {"success": True, "message": "Metrics updated successfully"}
+
+
+class ContributionAnalyticsEvent(BaseModel):
+    """Analytics event for contribution tracking"""
+    event_type: str  # "page_view", "word_selected", "contribution_started", "contribution_completed", "contribution_failed"
+    word: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+@app.post("/api/analytics/contribution")
+async def log_contribution_analytics(event: ContributionAnalyticsEvent):
+    """
+    📊 CONTRIBUTION ANALYTICS
+
+    Track contribution system usage for analytics dashboard.
+
+    Event Types:
+    - page_view: User views contribution page
+    - word_selected: User selects a word to contribute
+    - contribution_started: User starts recording
+    - contribution_completed: User successfully submits contribution
+    - contribution_failed: Contribution submission failed
+    """
+    if not DASHBOARD_AVAILABLE:
+        # Still accept events even if dashboard unavailable (for future processing)
+        return {"success": True, "message": "Event logged (dashboard offline)"}
+
+    try:
+        dashboard = get_dashboard(BRAIN_DIR)
+        metrics = dashboard.get_metrics()
+
+        # Track contribution events
+        if "contribution_events" not in metrics:
+            metrics["contribution_events"] = {
+                "page_views": 0,
+                "words_selected": 0,
+                "contributions_started": 0,
+                "contributions_completed": 0,
+                "contributions_failed": 0,
+                "by_word": {}
+            }
+
+        # Increment event counter
+        event_map = {
+            "page_view": "page_views",
+            "word_selected": "words_selected",
+            "contribution_started": "contributions_started",
+            "contribution_completed": "contributions_completed",
+            "contribution_failed": "contributions_failed"
+        }
+
+        if event.event_type in event_map:
+            metrics["contribution_events"][event_map[event.event_type]] += 1
+
+        # Track per-word statistics
+        if event.word:
+            if event.word not in metrics["contribution_events"]["by_word"]:
+                metrics["contribution_events"]["by_word"][event.word] = {
+                    "selected": 0,
+                    "started": 0,
+                    "completed": 0,
+                    "failed": 0
+                }
+
+            word_stats = metrics["contribution_events"]["by_word"][event.word]
+            if event.event_type == "word_selected":
+                word_stats["selected"] += 1
+            elif event.event_type == "contribution_started":
+                word_stats["started"] += 1
+            elif event.event_type == "contribution_completed":
+                word_stats["completed"] += 1
+            elif event.event_type == "contribution_failed":
+                word_stats["failed"] += 1
+
+        # Update metrics
+        dashboard.update_metrics(metrics)
+
+        return {
+            "success": True,
+            "message": f"Analytics event '{event.event_type}' logged",
+            "word": event.word
+        }
+
+    except Exception as e:
+        # Don't fail the request if analytics fails
+        print(f"⚠ Analytics logging failed: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/api/analytics/contribution/stats")
+async def get_contribution_analytics():
+    """
+    📊 GET CONTRIBUTION ANALYTICS
+
+    Returns contribution system statistics for dashboard
+    """
+    if not DASHBOARD_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Analytics dashboard not available")
+
+    dashboard = get_dashboard(BRAIN_DIR)
+    metrics = dashboard.get_metrics()
+
+    # Get contribution events or return defaults
+    contribution_events = metrics.get("contribution_events", {
+        "page_views": 0,
+        "words_selected": 0,
+        "contributions_started": 0,
+        "contributions_completed": 0,
+        "contributions_failed": 0,
+        "by_word": {}
+    })
+
+    # Calculate conversion rates
+    completion_rate = 0
+    if contribution_events["contributions_started"] > 0:
+        completion_rate = (contribution_events["contributions_completed"] /
+                          contribution_events["contributions_started"]) * 100
+
+    # Get top contributed words
+    top_words = sorted(
+        contribution_events["by_word"].items(),
+        key=lambda x: x[1]["completed"],
+        reverse=True
+    )[:10]
+
+    return {
+        "success": True,
+        "stats": {
+            "overview": {
+                "page_views": contribution_events["page_views"],
+                "words_selected": contribution_events["words_selected"],
+                "contributions_started": contribution_events["contributions_started"],
+                "contributions_completed": contribution_events["contributions_completed"],
+                "contributions_failed": contribution_events["contributions_failed"],
+                "completion_rate": round(completion_rate, 1)
+            },
+            "top_contributed_words": [
+                {
+                    "word": word,
+                    "completed": stats["completed"],
+                    "started": stats["started"],
+                    "failed": stats["failed"]
+                }
+                for word, stats in top_words
+            ]
+        },
+        "timestamp": datetime.now().isoformat()
+    }
 
 
 # ============================================
@@ -1522,6 +1821,258 @@ async def get_top_missing_words(limit: int = 20):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/reset-and-seed-database")
+async def reset_and_seed_database():
+    """ADMIN ONLY: Reset database and reseed with correct sign words from brain_metadata.json"""
+    import json
+
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        from database import SessionLocal, Word, init_db
+
+        # Initialize database
+        init_db()
+        db = SessionLocal()
+
+        # Delete all existing words
+        deleted = db.query(Word).delete()
+        db.commit()
+
+        # Load brain metadata (EXACT SAME LOGIC as seed_database.py)
+        brain_file = Path("/data/ghsl_brain/brain_metadata.json")
+        if not brain_file.exists():
+            brain_file = BRAIN_DIR / "brain_metadata.json"
+        if not brain_file.exists():
+            brain_file = Path("../ghsl_brain/brain_metadata.json")
+
+        if not brain_file.exists():
+            raise HTTPException(status_code=404, detail="brain_metadata.json not found")
+
+        with open(brain_file, 'r') as f:
+            brain_data = json.load(f)
+
+        # Handle if brain_data is a list or dict (EXACT SAME as seed_database.py)
+        if isinstance(brain_data, list):
+            words_list = [item['word'].upper() for item in brain_data if 'word' in item]
+        else:
+            words_list = [sign_data['word'].upper() for sign_id, sign_data in brain_data.items()]
+
+        # Deduplicate words_list
+        words_list = list(set(words_list))
+
+        # Insert new words (skip duplicates)
+        added = 0
+        skipped = 0
+        for idx, word in enumerate(words_list, 1):
+            try:
+                # Check if word already exists
+                existing = db.query(Word).filter(Word.word == word).first()
+                if existing:
+                    skipped += 1
+                    continue
+
+                word_entry = Word(
+                    word=word,
+                    contributions_count=0,
+                    contributions_needed=50,
+                    is_complete=False,
+                    quality_score=None
+                )
+                db.add(word_entry)
+                db.commit()  # Commit each word individually to avoid batch conflicts
+                added += 1
+            except Exception as e:
+                db.rollback()
+                skipped += 1
+                print(f"Skipped {word}: {e}")
+
+        total_words = db.query(Word).count()
+        first_10 = [w.word for w in db.query(Word).limit(10).all()]
+
+        db.close()
+
+        return {
+            "success": True,
+            "deleted": deleted,
+            "added": added,
+            "skipped": skipped,
+            "total_in_db": total_words,
+            "sample_words": first_10
+        }
+
+    except Exception as e:
+        if 'db' in locals():
+            db.rollback()
+            db.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/admin/corrections/reset")
+async def reset_user_corrections():
+    """ADMIN ONLY: Reset all user corrections by deleting the user_corrections.json file"""
+    import json
+
+    corrections_file = BRAIN_DIR / "user_corrections.json"
+
+    if not corrections_file.exists():
+        return {
+            "success": True,
+            "message": "No user corrections file found (already clean)"
+        }
+
+    try:
+        # Backup the file before deleting
+        backup_file = BRAIN_DIR / f"user_corrections_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        # Read current corrections
+        with open(corrections_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Save backup
+        with open(backup_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        # Delete the corrections file
+        corrections_file.unlink()
+
+        correction_count = len(data.get("corrections", []))
+
+        return {
+            "success": True,
+            "message": f"Deleted {correction_count} user corrections",
+            "backup_file": str(backup_file),
+            "deleted_corrections": correction_count
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reset corrections: {str(e)}")
+
+
+@app.delete("/api/admin/corrections/{query}")
+async def delete_query_correction(query: str):
+    """ADMIN ONLY: Delete user correction for a specific query"""
+    import json
+
+    corrections_file = BRAIN_DIR / "user_corrections.json"
+
+    if not corrections_file.exists():
+        raise HTTPException(status_code=404, detail="No user corrections file found")
+
+    try:
+        # Read current corrections
+        with open(corrections_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        corrections = data.get("corrections", [])
+        original_count = len(corrections)
+
+        # Filter out corrections for this query
+        query_lower = query.lower()
+        filtered_corrections = [c for c in corrections if c.get("query") != query_lower]
+        deleted_count = original_count - len(filtered_corrections)
+
+        if deleted_count == 0:
+            raise HTTPException(status_code=404, detail=f"No corrections found for query: {query}")
+
+        # Update data
+        data["corrections"] = filtered_corrections
+        data["total_corrections"] = len(filtered_corrections)
+        data["last_updated"] = datetime.now().isoformat()
+
+        # Save updated file
+        with open(corrections_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        return {
+            "success": True,
+            "message": f"Deleted {deleted_count} correction(s) for query: {query}",
+            "remaining_corrections": len(filtered_corrections)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete corrections: {str(e)}")
+
+
+@app.post("/api/admin/migrate-classification-fields")
+async def migrate_classification_fields():
+    """ADMIN ONLY: Add classification and 3-attempt fields to database"""
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        from sqlalchemy import text, create_engine
+        import os
+
+        DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://ghsl:ghsl_dev_pass@localhost:5432/ghsl_contributions")
+        engine = create_engine(DATABASE_URL)
+
+        with engine.connect() as conn:
+            # Add fields to Word table
+            conn.execute(text("""
+                ALTER TABLE words
+                ADD COLUMN IF NOT EXISTS static_votes INTEGER DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS dynamic_votes INTEGER DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS sign_type_consensus VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS consensus_confidence FLOAT;
+            """))
+            conn.commit()
+
+            # Add fields to Contribution table
+            conn.execute(text("""
+                ALTER TABLE contributions
+                ADD COLUMN IF NOT EXISTS sign_type_movement VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS sign_type_hands VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS num_attempts INTEGER DEFAULT 1,
+                ADD COLUMN IF NOT EXISTS individual_qualities JSON,
+                ADD COLUMN IF NOT EXISTS individual_durations JSON,
+                ADD COLUMN IF NOT EXISTS quality_variance FLOAT,
+                ADD COLUMN IF NOT EXISTS improvement_trend VARCHAR(100);
+            """))
+            conn.commit()
+
+        return {
+            "success": True,
+            "message": "Migration successful: added classification and 3-attempt fields"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+
+
+@app.post("/api/admin/migrate-file-path-nullable")
+async def migrate_file_path_nullable():
+    """ADMIN ONLY: Make file_path column nullable in contributions table"""
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        from sqlalchemy import text, create_engine
+        import os
+
+        DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://ghsl:ghsl_dev_pass@localhost:5432/ghsl_contributions")
+        engine = create_engine(DATABASE_URL)
+
+        with engine.connect() as conn:
+            # Make file_path nullable
+            conn.execute(text("""
+                ALTER TABLE contributions
+                ALTER COLUMN file_path DROP NOT NULL
+            """))
+            conn.commit()
+
+        return {
+            "success": True,
+            "message": "Migration successful: file_path is now nullable"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
 
 if __name__ == "__main__":

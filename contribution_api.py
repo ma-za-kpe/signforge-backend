@@ -68,7 +68,7 @@ class Contribution(BaseModel):
     """Complete contribution submission."""
     word: str = Field(..., min_length=1, max_length=100, description="GSL word being signed")
     user_id: str = Field(..., min_length=1, max_length=100, description="Anonymous user identifier")
-    frames: List[Frame] = Field(..., min_items=30, max_items=90, description="30-90 frames (1-3 seconds @ 30fps)")
+    frames: List[Frame] = Field(..., min_items=30, max_items=150, description="30-150 frames (1-5 seconds @ 30fps)")
     duration: float = Field(..., gt=0.5, lt=5.0, description="Recording duration in seconds")
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional metadata")
 
@@ -89,8 +89,8 @@ class Contribution(BaseModel):
 
     @validator('frames')
     def validate_frame_count(cls, v):
-        if not (30 <= len(v) <= 90):
-            raise ValueError(f"Expected 30-90 frames, got {len(v)}")
+        if not (30 <= len(v) <= 150):
+            raise ValueError(f"Expected 30-150 frames, got {len(v)}")
         return v
 
 
@@ -883,6 +883,69 @@ async def get_contribution_stats(word: str):
         ready_for_training=stats["ready_for_training"],
         contributions_needed=contributions_needed
     )
+
+
+class WordClassificationResponse(BaseModel):
+    """Response with word's consensus classification data."""
+    word: str
+    sign_type_consensus: Optional[str] = None  # 'static', 'dynamic', or 'unknown'
+    consensus_confidence: Optional[float] = None
+    static_votes: int = 0
+    dynamic_votes: int = 0
+    total_votes: int = 0
+    has_consensus: bool = False
+
+
+@router.get("/words/{word}/classification", response_model=WordClassificationResponse)
+async def get_word_classification(word: str):
+    """
+    Get the crowdsourced classification consensus for a word.
+
+    This endpoint retrieves existing classification data from the database,
+    which can be used to pre-fill classification forms or display consensus.
+
+    Args:
+        word: GSL word (case-insensitive)
+
+    Returns:
+        WordClassificationResponse with consensus data
+    """
+    db = SessionLocal()
+    try:
+        word_upper = word.upper().strip()
+        word_record = db.query(Word).filter(Word.word == word_upper).first()
+
+        if not word_record:
+            # Word doesn't exist yet, return empty classification
+            return WordClassificationResponse(
+                word=word_upper,
+                sign_type_consensus=None,
+                consensus_confidence=None,
+                static_votes=0,
+                dynamic_votes=0,
+                total_votes=0,
+                has_consensus=False
+            )
+
+        total_votes = word_record.static_votes + word_record.dynamic_votes
+        has_consensus = (
+            word_record.sign_type_consensus is not None
+            and word_record.sign_type_consensus != 'unknown'
+            and word_record.consensus_confidence is not None
+            and word_record.consensus_confidence >= 0.7
+        )
+
+        return WordClassificationResponse(
+            word=word_upper,
+            sign_type_consensus=word_record.sign_type_consensus,
+            consensus_confidence=word_record.consensus_confidence,
+            static_votes=word_record.static_votes,
+            dynamic_votes=word_record.dynamic_votes,
+            total_votes=total_votes,
+            has_consensus=has_consensus
+        )
+    finally:
+        db.close()
 
 
 @router.get("/contribution-leaderboard")
