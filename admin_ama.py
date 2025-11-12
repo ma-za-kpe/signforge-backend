@@ -88,6 +88,30 @@ class ContributionDetail(BaseModel):
     metadata: Optional[Dict[str, Any]]
 
 
+class ContributionFullDetail(BaseModel):
+    """Full contribution information with pose sequence data"""
+    id: int
+    word: str
+    user_id: str
+    duration: float
+    quality_score: float
+    num_frames: int
+    fps: float
+    data_points: int
+    has_left_hand: bool
+    has_right_hand: bool
+    created_at: datetime
+    metadata: Optional[Dict[str, Any]]
+    pose_sequence: List[List[List[float]]]  # [frames][landmarks][x,y,z,v]
+    quality_breakdown: Optional[Dict[str, Any]]
+
+
+class ContributionUpdateRequest(BaseModel):
+    """Request model for updating contribution"""
+    word: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 class DataQualityReport(BaseModel):
     """Data quality analysis report"""
     total_contributions: int
@@ -658,6 +682,157 @@ async def delete_all_contributions(confirm: bool = False, db: Session = Depends(
         "words_affected": word_list,
         "warning": "All contribution data has been permanently removed"
     }
+
+
+@router.get("/contributions/{contribution_id}", response_model=ContributionFullDetail)
+async def get_contribution_detail(contribution_id: int, db: Session = Depends(get_db)):
+    """
+    📋 GET CONTRIBUTION DETAIL - Get full contribution data including pose sequence
+
+    Returns complete contribution information with pose sequence data for preview/analysis.
+
+    Use cases:
+    - Preview contribution before deletion
+    - Analyze pose quality
+    - Export for training
+    - Detailed inspection
+    """
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    contribution = db.query(Contribution).filter(Contribution.id == contribution_id).first()
+
+    if not contribution:
+        raise HTTPException(status_code=404, detail=f"Contribution {contribution_id} not found")
+
+    # Calculate metrics
+    fps = calculate_fps(contribution)
+    data_points = calculate_data_points(contribution)
+    has_left, has_right = check_hand_presence(contribution)
+
+    # Parse metadata
+    try:
+        if contribution.metadata is None:
+            metadata_dict = None
+        elif isinstance(contribution.metadata, str):
+            metadata_dict = json.loads(contribution.metadata)
+        elif isinstance(contribution.metadata, dict):
+            metadata_dict = contribution.metadata
+        else:
+            metadata_dict = dict(contribution.metadata) if contribution.metadata else None
+    except:
+        metadata_dict = None
+
+    # Get quality breakdown if available
+    quality_breakdown = None
+    if hasattr(contribution, 'frames_data') and contribution.frames_data:
+        try:
+            quality_breakdown = contribution.frames_data
+        except:
+            pass
+
+    return ContributionFullDetail(
+        id=contribution.id,
+        word=contribution.word,
+        user_id=contribution.user_id,
+        duration=contribution.duration,
+        quality_score=contribution.quality_score,
+        num_frames=contribution.num_frames,
+        fps=round(fps, 2),
+        data_points=data_points,
+        has_left_hand=has_left,
+        has_right_hand=has_right,
+        created_at=contribution.created_at,
+        metadata=metadata_dict,
+        pose_sequence=contribution.pose_sequence,
+        quality_breakdown=quality_breakdown
+    )
+
+
+@router.patch("/contributions/{contribution_id}", response_model=ContributionDetail)
+async def update_contribution(
+    contribution_id: int,
+    update_data: ContributionUpdateRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    ✏️ UPDATE CONTRIBUTION - Update contribution word or metadata
+
+    Allows admins to:
+    - Correct word labels
+    - Add/update metadata
+    - Fix categorization errors
+
+    Query Parameters:
+    - word: New word label (optional)
+    - metadata: New metadata dictionary (optional)
+
+    Returns updated contribution details
+    """
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    contribution = db.query(Contribution).filter(Contribution.id == contribution_id).first()
+
+    if not contribution:
+        raise HTTPException(status_code=404, detail=f"Contribution {contribution_id} not found")
+
+    # Track changes
+    changes = []
+
+    # Update word if provided
+    if update_data.word is not None:
+        old_word = contribution.word
+        contribution.word = update_data.word.upper()
+        changes.append(f"word: {old_word} → {contribution.word}")
+        logger.info(f"Updated contribution {contribution_id} word: {old_word} → {contribution.word}")
+
+    # Update metadata if provided
+    if update_data.metadata is not None:
+        contribution.metadata = update_data.metadata
+        changes.append("metadata updated")
+        logger.info(f"Updated contribution {contribution_id} metadata")
+
+    if not changes:
+        raise HTTPException(status_code=400, detail="No updates provided")
+
+    db.commit()
+    db.refresh(contribution)
+
+    # Calculate metrics for response
+    fps = calculate_fps(contribution)
+    data_points = calculate_data_points(contribution)
+    has_left, has_right = check_hand_presence(contribution)
+
+    # Parse metadata for response
+    try:
+        if contribution.metadata is None:
+            metadata_dict = None
+        elif isinstance(contribution.metadata, str):
+            metadata_dict = json.loads(contribution.metadata)
+        elif isinstance(contribution.metadata, dict):
+            metadata_dict = contribution.metadata
+        else:
+            metadata_dict = dict(contribution.metadata) if contribution.metadata else None
+    except:
+        metadata_dict = None
+
+    logger.info(f"Contribution {contribution_id} updated successfully: {', '.join(changes)}")
+
+    return ContributionDetail(
+        id=contribution.id,
+        word=contribution.word,
+        user_id=contribution.user_id,
+        duration=contribution.duration,
+        quality_score=contribution.quality_score,
+        num_frames=contribution.num_frames,
+        fps=round(fps, 2),
+        data_points=data_points,
+        has_left_hand=has_left,
+        has_right_hand=has_right,
+        created_at=contribution.created_at,
+        metadata=metadata_dict
+    )
 
 
 @router.post("/contributions/{contribution_id}/approve")
