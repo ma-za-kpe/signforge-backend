@@ -102,7 +102,7 @@ class ContributionFullDetail(BaseModel):
     has_right_hand: bool
     created_at: datetime
     metadata: Optional[Dict[str, Any]]
-    pose_sequence: List[List[List[float]]]  # [frames][landmarks][x,y,z,v]
+    pose_sequence: List[Dict[str, Any]]  # frames_data format: list of frame objects
     quality_breakdown: Optional[Dict[str, Any]]
 
 
@@ -723,13 +723,13 @@ async def get_contribution_detail(contribution_id: int, db: Session = Depends(ge
     except:
         metadata_dict = None
 
-    # Get quality breakdown if available
+    # Use frames_data directly as pose_sequence (already in correct format)
+    pose_sequence = contribution.frames_data if hasattr(contribution, 'frames_data') and contribution.frames_data else []
+
+    # Get quality breakdown from frames_data if available
     quality_breakdown = None
-    if hasattr(contribution, 'frames_data') and contribution.frames_data:
-        try:
-            quality_breakdown = contribution.frames_data
-        except:
-            pass
+    if hasattr(contribution, 'individual_qualities') and contribution.individual_qualities:
+        quality_breakdown = contribution.individual_qualities
 
     return ContributionFullDetail(
         id=contribution.id,
@@ -744,7 +744,7 @@ async def get_contribution_detail(contribution_id: int, db: Session = Depends(ge
         has_right_hand=has_right,
         created_at=contribution.created_at,
         metadata=metadata_dict,
-        pose_sequence=contribution.pose_sequence,
+        pose_sequence=pose_sequence,
         quality_breakdown=quality_breakdown
     )
 
