@@ -1,0 +1,376 @@
+"""
+Video Upload Contribution API
+Handles video upload, pose extraction, and contribution submission
+Replaces webcam recording flow with server-side processing
+"""
+from fastapi import APIRouter, UploadFile, Form, HTTPException, Depends
+from pydantic import BaseModel
+from pathlib import Path
+from typing import List, Optional, Dict
+import uuid
+import os
+import logging
+from sqlalchemy.orm import Session
+
+from video_processor import (
+    process_video_to_poses,
+    calculate_quality_metrics,
+    get_quality_label,
+    auto_detect_sign_characteristics
+)
+from database import get_db, Contribution as DBContribution
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/contribute", tags=["contribution-upload"])
+
+
+# Pydantic Models
+class UploadResponse(BaseModel):
+    """Response from video upload and extraction"""
+    pose_sequence: List[List[List[float]]]
+    fps: float
+    total_frames: int
+    extracted_frames: int
+    duration: float
+    quality_breakdown: Dict[str, float]
+    quality_label: str
+    message: str
+
+
+class ContributionSubmission(BaseModel):
+    """Contribution data for final submission"""
+    word: str
+    user_id: str
+    pose_sequence: List[List[List[float]]]
+    fps: float
+    extracted_frames: int
+    duration: float
+    quality_score: float
+    sign_type_movement: Optional[str] = None
+    sign_type_hands: Optional[str] = None
+
+
+class SubmissionResponse(BaseModel):
+    """Response after successful contribution submission"""
+    contribution_id: str
+    word: str
+    quality_score: float
+    quality_label: str
+    total_contributions: int
+    message: str
+
+
+# API Endpoints
+@router.post("/upload", response_model=SubmissionResponse)
+async def upload_and_extract_video(
+    file: UploadFile,
+    word: str = Form(...),
+    user_id: str = Form(...),
+    sign_type_movement: Optional[str] = Form(None),
+    sign_type_hands: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
+):
+    """
+    Upload video, extract poses, calculate quality, save to database, DELETE video.
+
+    This endpoint now handles the entire flow:
+    1. Upload video
+    2. Extract poses with MediaPipe
+    3. Calculate quality metrics
+    4. Save contribution to database
+    5. Delete video file (privacy guarantee)
+
+    Privacy Guarantee: Video is ALWAYS deleted after processing, even if extraction fails.
+
+    Args:
+        file: Uploaded video file (MP4, WebM, MOV)
+        word: Sign language word being performed
+        user_id: Anonymous user identifier
+        sign_type_movement: 'static' or 'dynamic'
+        sign_type_hands: 'one-handed' or 'two-handed'
+        db: Database session
+
+    Returns:
+        Contribution submission response with ID and stats
+
+    Raises:
+        HTTPException 400: Invalid file format, duration, or quality too low
+        HTTPException 413: File too large (>50MB)
+        HTTPException 422: Video processing failed
+    """
+
+    logger.info(f"[UPLOAD] Upload request: {file.filename} for word '{word}' by user '{user_id}'")
+
+    # Validate file format
+    allowed_types = ["video/mp4", "video/webm", "video/quicktime"]
+    if file.content_type not in allowed_types:
+        logger.warning(f"[ERROR] Invalid format: {file.content_type}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file format. Allowed: {', '.join(allowed_types)}"
+        )
+
+    # Generate unique temporary filename
+    temp_filename = f"{uuid.uuid4()}_{word}_{user_id[:8]}.mp4"
+    temp_path = Path(f"/tmp/{temp_filename}")
+
+    logger.info(f"[SAVE] Saving to temporary file: {temp_path}")
+
+    try:
+        # Save uploaded file to temp location
+        MAX_SIZE = 50 * 1024 * 1024  # 50MB
+        file_size = 0
+
+        with open(temp_path, "wb") as buffer:
+            while chunk := await file.read(8192):  # Read in 8KB chunks
+                file_size += len(chunk)
+                if file_size > MAX_SIZE:
+                    logger.warning(f"[ERROR] File too large: {file_size / 1024 / 1024:.2f}MB")
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large ({file_size / 1024 / 1024:.1f}MB). Maximum 50MB allowed."
+                    )
+                buffer.write(chunk)
+
+        logger.info(f" File saved ({file_size / 1024 / 1024:.2f}MB)")
+
+        # Extract poses using MediaPipe
+        logger.info("[EXTRACT] Starting pose extraction...")
+        extraction_result = process_video_to_poses(temp_path)
+
+        logger.info(f" Extracted {extraction_result['extracted_frames']} frames")
+
+        # Validate duration
+        duration = extraction_result["duration"]
+        if duration < 2.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video too short ({duration:.1f}s). Minimum 2 seconds required."
+            )
+        if duration > 12.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video too long ({duration:.1f}s). Maximum 12 seconds allowed."
+            )
+
+        # Auto-detect sign characteristics if not provided
+        if not sign_type_movement or not sign_type_hands:
+            logger.info("[DETECT] Auto-detecting sign characteristics...")
+            detected = auto_detect_sign_characteristics(extraction_result["pose_sequence"])
+            sign_type_movement = sign_type_movement or detected["sign_type_movement"]
+            sign_type_hands = sign_type_hands or detected["sign_type_hands"]
+
+        # Calculate quality metrics
+        logger.info(f"[QUALITY] Calculating quality metrics (movement={sign_type_movement}, hands={sign_type_hands})...")
+        quality_breakdown = calculate_quality_metrics(
+            extraction_result["pose_sequence"],
+            sign_type_movement,
+            sign_type_hands
+        )
+
+        overall_score = quality_breakdown["overall_score"]
+        quality_label = get_quality_label(overall_score)
+
+        logger.info(f" Quality score: {overall_score:.2%} ({quality_label})")
+
+
+        # Check quality threshold before saving
+        MIN_QUALITY_THRESHOLD = 0.50  # Lowered from 0.60 to be more permissive
+        if overall_score < MIN_QUALITY_THRESHOLD:
+            logger.warning(f"[ERROR] Quality too low: {overall_score:.2%}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Quality too low ({overall_score:.0%}). Minimum {MIN_QUALITY_THRESHOLD:.0%} required. Please try recording again with better lighting and visibility."
+            )
+
+        # Generate contribution ID
+        contribution_id = f"{word}_{uuid.uuid4().hex[:12]}"
+
+        # Convert pose_sequence to frames_data format (compatible with existing schema)
+        pose_sequence = extraction_result["pose_sequence"]
+        fps = extraction_result["fps"]
+        frames_data = []
+
+        for frame_idx, frame_landmarks in enumerate(pose_sequence):
+            if len(frame_landmarks) < 75:
+                continue
+
+            # Split into pose, left hand, right hand
+            pose_landmarks = [{"x": lm[0], "y": lm[1], "z": lm[2], "visibility": lm[3]} for lm in frame_landmarks[:33]]
+            left_hand = [{"x": lm[0], "y": lm[1], "z": lm[2], "visibility": lm[3]} for lm in frame_landmarks[33:54]]
+            right_hand = [{"x": lm[0], "y": lm[1], "z": lm[2], "visibility": lm[3]} for lm in frame_landmarks[54:75]]
+
+            frames_data.append({
+                "frame_number": frame_idx,
+                "timestamp": frame_idx / fps,
+                "pose_landmarks": pose_landmarks,
+                "left_hand_landmarks": left_hand if any(lm[3] > 0 for lm in frame_landmarks[33:54]) else None,
+                "right_hand_landmarks": right_hand if any(lm[3] > 0 for lm in frame_landmarks[54:75]) else None,
+                "face_landmarks": None
+            })
+
+        # Create database record
+        db_contribution = DBContribution(
+            contribution_id=contribution_id,
+            word=word.upper(),
+            user_id=user_id,
+            num_frames=extraction_result["extracted_frames"],
+            duration=extraction_result["duration"],
+            quality_score=overall_score,
+            file_path=None,  # No video file stored (privacy)
+            frames_data=frames_data,
+            sign_type_movement=sign_type_movement,
+            sign_type_hands=sign_type_hands,
+            created_at=datetime.utcnow()
+        )
+
+        # Save to database
+        try:
+            db.add(db_contribution)
+            db.commit()
+            db.refresh(db_contribution)
+
+            # Get contribution stats for this word
+            total_contributions = db.query(DBContribution).filter(
+                DBContribution.word == word.upper()
+            ).count()
+
+            logger.info(f"✅ Contribution saved: {contribution_id} (total for '{word}': {total_contributions})")
+
+            return SubmissionResponse(
+                contribution_id=contribution_id,
+                word=word,
+                quality_score=overall_score,
+                quality_label=quality_label,
+                total_contributions=total_contributions,
+                message=f"✅ Contribution submitted successfully! Total contributions for '{word}': {total_contributions}"
+            )
+
+        except Exception as db_error:
+            db.rollback()
+            logger.error(f"[ERROR] Database error: {str(db_error)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save contribution: {str(db_error)}"
+            )
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+
+    except Exception as e:
+        logger.error(f"[ERROR] Processing error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=422,
+            detail=f"Failed to process video: {str(e)}"
+        )
+
+    finally:
+        # GUARANTEED VIDEO DELETION (privacy guarantee)
+        if temp_path.exists():
+            os.remove(temp_path)
+            logger.info(f"=� Video deleted: {temp_path.name}")
+
+
+@router.post("/submit", response_model=SubmissionResponse)
+async def submit_contribution(
+    submission: ContributionSubmission,
+    db: Session = Depends(get_db)
+):
+    """
+    Save extracted contribution to database.
+
+    Frontend already has pose data from /upload endpoint.
+    This endpoint just saves to database.
+
+    Args:
+        submission: Contribution data with poses and metadata
+        db: Database session
+
+    Returns:
+        Confirmation with contribution ID and stats
+
+    Raises:
+        HTTPException 400: Quality too low or invalid data
+    """
+
+    logger.info(f"[SUBMIT] Submitting contribution: {submission.word} by {submission.user_id}")
+
+    # Validate quality threshold
+    MIN_QUALITY_THRESHOLD = 0.60
+    if submission.quality_score < MIN_QUALITY_THRESHOLD:
+        logger.warning(f"[ERROR] Quality too low: {submission.quality_score:.2%}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Quality too low ({submission.quality_score:.0%}). Minimum {MIN_QUALITY_THRESHOLD:.0%} required."
+        )
+
+    # Generate contribution ID
+    contribution_id = f"{submission.word}_{uuid.uuid4().hex[:12]}"
+
+    # Convert pose_sequence to frames_data format (compatible with existing schema)
+    frames_data = []
+    for frame_idx, frame_landmarks in enumerate(submission.pose_sequence):
+        if len(frame_landmarks) < 75:
+            continue
+
+        # Split into pose, left hand, right hand
+        pose_landmarks = [{"x": lm[0], "y": lm[1], "z": lm[2], "visibility": lm[3]} for lm in frame_landmarks[:33]]
+        left_hand = [{"x": lm[0], "y": lm[1], "z": lm[2], "visibility": lm[3]} for lm in frame_landmarks[33:54]]
+        right_hand = [{"x": lm[0], "y": lm[1], "z": lm[2], "visibility": lm[3]} for lm in frame_landmarks[54:75]]
+
+        frames_data.append({
+            "frame_number": frame_idx,
+            "timestamp": frame_idx / submission.fps,
+            "pose_landmarks": pose_landmarks,
+            "left_hand_landmarks": left_hand if any(lm[3] > 0 for lm in frame_landmarks[33:54]) else None,
+            "right_hand_landmarks": right_hand if any(lm[3] > 0 for lm in frame_landmarks[54:75]) else None,
+            "face_landmarks": None
+        })
+
+    # Create database record
+    db_contribution = DBContribution(
+        contribution_id=contribution_id,
+        word=submission.word.upper(),
+        user_id=submission.user_id,
+        num_frames=submission.extracted_frames,
+        duration=submission.duration,
+        quality_score=submission.quality_score,
+        file_path=None,  # No video file stored (privacy)
+        frames_data=frames_data,
+        sign_type_movement=submission.sign_type_movement,
+        sign_type_hands=submission.sign_type_hands,
+        created_at=datetime.utcnow()
+        # NOTE: No 3-attempt fields (removed in new design)
+    )
+
+    try:
+        db.add(db_contribution)
+        db.commit()
+        db.refresh(db_contribution)
+
+        # Get contribution stats for this word
+        total_contributions = db.query(DBContribution).filter(
+            DBContribution.word == submission.word.upper()
+        ).count()
+
+        logger.info(f" Contribution saved: {contribution_id} (total for '{submission.word}': {total_contributions})")
+
+        return SubmissionResponse(
+            contribution_id=contribution_id,
+            word=submission.word,
+            quality_score=submission.quality_score,
+            quality_label=get_quality_label(submission.quality_score),
+            total_contributions=total_contributions,
+            message=f" Contribution submitted successfully! Total contributions for '{submission.word}': {total_contributions}"
+        )
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[ERROR] Database error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save contribution: {str(e)}"
+        )

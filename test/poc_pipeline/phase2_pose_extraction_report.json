@@ -1,0 +1,17 @@
+{
+  "PAIN": {
+    "pose_file": "test/poc_pipeline/PAIN_poses.json",
+    "num_frames": 291,
+    "quality": "real_video_data"
+  },
+  "FEVER": {
+    "pose_file": "test/poc_pipeline/FEVER_poses.json",
+    "num_frames": 213,
+    "quality": "real_video_data"
+  },
+  "DOCTOR": {
+    "pose_file": "test/poc_pipeline/DOCTOR_poses.json",
+    "num_frames": 216,
+    "quality": "real_video_data"
+  }
+}

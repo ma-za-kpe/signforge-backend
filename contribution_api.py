@@ -466,7 +466,30 @@ def save_contribution(contribution: Contribution, contribution_id: str, quality_
 
     Returns:
         Contribution ID
+
+    Raises:
+        HTTPException: If quality score is below minimum threshold (60%)
     """
+    # Quality threshold check - reject contributions below 60%
+    MIN_QUALITY_THRESHOLD = 0.60
+    if quality_score < MIN_QUALITY_THRESHOLD:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "Quality too low",
+                "message": f"Contribution quality ({quality_score:.1%}) is below minimum acceptable threshold ({MIN_QUALITY_THRESHOLD:.0%}). Please try again with better lighting, hand positioning, and steadier movement.",
+                "quality_score": round(quality_score, 3),
+                "minimum_required": MIN_QUALITY_THRESHOLD,
+                "tips": [
+                    "Ensure good lighting on your hands",
+                    "Keep hands clearly visible in frame",
+                    "Make smooth, deliberate movements",
+                    "Avoid quick or jittery motions",
+                    "Use a clear background"
+                ]
+            }
+        )
+
     # Prepare frames data for storage
     frames_data = [frame.dict() for frame in contribution.frames]
 
@@ -543,6 +566,9 @@ def save_contribution(contribution: Contribution, contribution_id: str, quality_
             # Check if complete (50 contributions needed)
             if word_record.contributions_count >= word_record.contributions_needed:
                 word_record.is_complete = True
+                # Automatically close word when it reaches 50 contributions
+                word_record.is_open_for_contribution = False
+                print(f"✓ Auto-closed {word_upper} - reached {word_record.contributions_count} contributions")
         else:
             # Create new word record if it doesn't exist
             word_record = Word(
@@ -817,6 +843,38 @@ async def receive_contribution(contribution: Contribution):
             detail=detail_message
         )
 
+    # Check if word is open for contribution
+    from database import get_db, Word
+    db = next(get_db())
+    word_upper = contribution.word.upper()
+    word_record = db.query(Word).filter(Word.word == word_upper).first()
+
+    if not word_record:
+        db.close()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Word '{word_upper}' not found in the dictionary. Please select a valid sign."
+        )
+
+    if not word_record.is_open_for_contribution:
+        db.close()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This sign is currently closed for contributions. Please choose a different sign that is open for data collection."
+        )
+
+    db.close()
+
+    # Check if word has already reached the contribution limit
+    stats = count_contributions(contribution.word)
+    target_contributions = 50
+
+    if stats["total_contributions"] >= target_contributions:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This sign has already reached the maximum of {target_contributions} contributions. Please choose a different sign to contribute to."
+        )
+
     # Generate unique contribution ID
     contribution_id = str(uuid.uuid4())[:8]
 
@@ -829,11 +887,10 @@ async def receive_contribution(contribution: Contribution):
             detail=f"Failed to save contribution: {str(e)}"
         )
 
-    # Get updated statistics
+    # Get updated statistics (after saving)
     stats = count_contributions(contribution.word)
 
-    # Calculate progress (target: 10 contributions per sign)
-    target_contributions = 10
+    # Calculate progress (target: 50 contributions per sign)
     progress = min(100.0, (stats["total_contributions"] / target_contributions) * 100)
 
     # Create quality breakdown response

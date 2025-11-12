@@ -48,10 +48,47 @@ except ImportError as e:
 # Import training queue system (optional)
 training_router = None
 try:
-    from training_queue import router as training_router
-    print("✓ Training queue system loaded")
+    from training_api import router as training_router
+    print("✓ AI Training monitoring system loaded")
 except ImportError as e:
-    print(f"⚠ Training queue system not available: {e}")
+    try:
+        # Fallback to old training_queue if training_api not available
+        from training_queue import router as training_router
+        print("✓ Training queue system loaded")
+    except ImportError as e2:
+        print(f"⚠ Training system not available: {e}")
+
+# Import admin AMA system (optional)
+admin_router = None
+try:
+    from admin_ama import router as admin_router
+    print("✓ Admin AMA system loaded")
+except ImportError as e:
+    print(f"⚠ Admin AMA system not available: {e}")
+
+# Import skeleton preview system (optional)
+skeleton_router = None
+try:
+    from skeleton_preview_api import router as skeleton_router
+    print("✓ Skeleton preview system loaded")
+except ImportError as e:
+    print(f"⚠ Skeleton preview system not available: {e}")
+
+# Import reference skeletons system (optional)
+reference_skeletons_router = None
+try:
+    from reference_skeletons_api import router as reference_skeletons_router
+    print("✓ Reference skeletons system loaded")
+except ImportError as e:
+    print(f"⚠ Reference skeletons system not available: {e}")
+
+# Import upload contribution system (video upload feature)
+upload_contribution_router = None
+try:
+    from upload_contribution_api import router as upload_contribution_router
+    print("✓ Upload contribution system loaded")
+except ImportError as e:
+    print(f"⚠ Upload contribution system not available: {e}")
 
 app = FastAPI(
     title="Ghana Sign Language API",
@@ -69,13 +106,32 @@ async def startup_event():
         except Exception as e:
             print(f"⚠ Database initialization failed: {e}")
 
+    # Preload hybrid search brain to avoid blocking first request
+    try:
+        from hybrid_search_service import get_hybrid_search_service
+        print("🔄 Preloading search brain...")
+        search_service = get_hybrid_search_service(BRAIN_DIR)
+        print("✅ Search brain preloaded and ready")
+    except Exception as e:
+        print(f"⚠ Search brain preload failed: {e}")
+
 # CORS configuration for Next.js frontend
-# Using allow_origin_regex to match all Vercel deployment URLs
+# Allow all Vercel deployments and localhost
 import re
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+",
+    allow_origins=[
+        "https://frontend-theta-three-66.vercel.app",
+        "https://frontend-osplbhh77-popos-projects-fb891440.vercel.app",
+        "https://frontend-o9aokhme9-popos-projects-fb891440.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "http://localhost:3003",
+        "http://localhost:3004",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -116,6 +172,34 @@ if training_router:
     print("✓ Training queue routes mounted")
 else:
     print("⚠ Training queue routes not available")
+
+# Mount admin AMA router (if available)
+if admin_router:
+    app.include_router(admin_router)
+    print("✓ Admin AMA routes mounted at /api/ama")
+else:
+    print("⚠ Admin AMA routes not available")
+
+# Mount skeleton preview router (if available)
+if skeleton_router:
+    app.include_router(skeleton_router)
+    print("✓ Skeleton preview routes mounted at /api/skeleton-preview")
+else:
+    print("⚠ Skeleton preview routes not available")
+
+# Mount reference skeletons router (if available)
+if reference_skeletons_router:
+    app.include_router(reference_skeletons_router)
+    print("✓ Reference skeletons routes mounted at /api/skeletons")
+else:
+    print("⚠ Reference skeletons routes not available")
+
+# Mount upload contribution router (if available)
+if upload_contribution_router:
+    app.include_router(upload_contribution_router)
+    print("✓ Upload contribution routes mounted at /api/contribute/upload, /api/contribute/submit")
+else:
+    print("⚠ Upload contribution routes not available")
 
 
 # Models
@@ -205,76 +289,78 @@ async def get_dictionary_words(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=100),
 ):
-    """Get paginated list of dictionary words with contribution status"""
-    if DB_AVAILABLE:
-        try:
-            # Try database first
-            db = next(get_db())
-            offset = (page - 1) * per_page
-            words = db.query(Word).order_by(
-                Word.is_complete.asc(),
-                Word.contributions_count.desc()
-            ).offset(offset).limit(per_page).all()
+    """
+    Get paginated list of dictionary words with contribution status.
 
-            total_count = db.query(Word).count()
-            db.close()
+    IMPORTANT: Only returns words that are OPEN for contribution (is_open_for_contribution = True).
+    This implements the word gating system where admins control which words users can contribute to.
 
-            return {
-                "words": [
-                    {
-                        "word": w.word,
-                        "contributions": w.contributions_count,
-                        "needed": w.contributions_needed,
-                        "ready": w.is_complete,
-                        "quality_score": w.quality_score
-                    }
-                    for w in words
-                ],
-                "total": total_count,
-                "page": page,
-                "per_page": per_page,
-                "total_pages": (total_count + per_page - 1) // per_page
-            }
-        except Exception:
-            pass  # Fall through to file-based fallback
+    Returns empty list if no words are currently open.
+    """
+    if not DB_AVAILABLE:
+        # If database is not available, return empty list (no words open)
+        return {
+            "words": [],
+            "total": 0,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": 0
+        }
 
-    # Fallback: load from terms.json
-    import json
-    terms_file = BRAIN_DIR / "terms.json"
-    if not terms_file.exists():
-        raise HTTPException(status_code=404, detail="Dictionary not found")
+    try:
+        # Query database for ONLY open words
+        db = next(get_db())
+        offset = (page - 1) * per_page
 
-    with open(terms_file, "r", encoding="utf-8") as f:
-        terms = json.load(f)
+        # Filter only words that are open for contribution
+        words = db.query(Word).filter(
+            Word.is_open_for_contribution == True
+        ).order_by(
+            Word.is_complete.asc(),
+            Word.contributions_count.desc()
+        ).offset(offset).limit(per_page).all()
 
-    # terms.json is a dict with numeric keys, extract "word" field from values
-    if isinstance(terms, dict):
-        words = sorted([data['word'].upper() for data in terms.values() if 'word' in data])
-    else:
-        words = sorted([term.upper() for term in terms])
+        total_count = db.query(Word).filter(
+            Word.is_open_for_contribution == True
+        ).count()
 
-    total_count = len(words)
+        # Calculate actual contribution counts from source of truth
+        from database import Contribution as DBContribution
 
-    # Paginate
-    offset = (page - 1) * per_page
-    page_words = words[offset:offset + per_page]
+        words_with_actual_counts = []
+        for w in words:
+            # Count actual contributions from contributions table (source of truth)
+            actual_count = db.query(DBContribution).filter(
+                DBContribution.word == w.word
+            ).count()
 
-    return {
-        "words": [
-            {
-                "word": w,
-                "contributions": 0,
-                "needed": 50,
-                "ready": False,
-                "quality_score": None
-            }
-            for w in page_words
-        ],
-        "total": total_count,
-        "page": page,
-        "per_page": per_page,
-        "total_pages": (total_count + per_page - 1) // per_page
-    }
+            words_with_actual_counts.append({
+                "word": w.word,
+                "contributions": actual_count,  # Use ACTUAL count, not stale w.contributions_count
+                "needed": w.contributions_needed,
+                "ready": actual_count >= w.contributions_needed,  # Calculate from actual
+                "quality_score": w.quality_score
+            })
+
+        db.close()
+
+        return {
+            "words": words_with_actual_counts,
+            "total": total_count,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": (total_count + per_page - 1) // per_page if total_count > 0 else 0
+        }
+    except Exception as e:
+        print(f"Error querying open words: {e}")
+        # Return empty list on error (fail closed, not open)
+        return {
+            "words": [],
+            "total": 0,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": 0
+        }
 
 
 @app.get("/api/search", response_model=SearchResponse)

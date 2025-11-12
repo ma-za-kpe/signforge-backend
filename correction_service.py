@@ -57,8 +57,6 @@ class CorrectionService:
         is_correct: bool = False,
         user_comment: Optional[str] = None,
         confidence_score: float = 0.0,
-        ip_address: Optional[str] = None,  # NEW: Security tracking
-        user_agent: Optional[str] = None,  # NEW: Security tracking
     ) -> Dict:
         """
         Flag a search result as incorrect
@@ -70,8 +68,6 @@ class CorrectionService:
             is_correct: Whether the result was correct
             user_comment: Optional user comment
             confidence_score: Confidence score of the result
-            ip_address: Client IP address (for security/rate limiting)
-            user_agent: Client user agent (for security/bot detection)
 
         Returns:
             Feedback entry with ID
@@ -86,8 +82,6 @@ class CorrectionService:
             "confidence_score": confidence_score,
             "timestamp": datetime.now().isoformat(),
             "status": "pending",  # pending, reviewed, applied
-            "ip_address": ip_address,  # NEW: Track source
-            "user_agent": user_agent,  # NEW: Detect bots
         }
 
         self.corrections.append(feedback)
@@ -155,19 +149,7 @@ class CorrectionService:
         Boost search results based on user corrections
 
         If users have flagged a query before, boost the correct result
-
-        SECURITY: Disabled by default until consensus-based system implemented
         """
-        import os
-
-        # SECURITY FIX: Require explicit opt-in to enable boosting
-        # Set environment variable ENABLE_CORRECTION_BOOST=true to enable
-        if os.getenv("ENABLE_CORRECTION_BOOST", "false").lower() != "true":
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info("⚠️ Correction boosting disabled for security (set ENABLE_CORRECTION_BOOST=true to enable)")
-            return search_results
-
         learning_map = self.get_learning_data()
         query_lower = query.lower()
 
@@ -221,8 +203,8 @@ class CorrectionService:
 
         logger.info(f"📊 '{correct_word}' has {correction_count} correction(s)")
 
-        # Threshold: 10+ corrections (increased for security - was 2)
-        AUTO_FIX_THRESHOLD = 10  # SECURITY FIX: Prevent easy data poisoning attacks
+        # Threshold: 2+ corrections
+        AUTO_FIX_THRESHOLD = 2
 
         if correction_count >= AUTO_FIX_THRESHOLD:
             # Check if already queued/fixed

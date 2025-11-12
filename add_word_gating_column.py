@@ -1,65 +1,49 @@
-#!/usr/bin/env python3
 """
-Migration script to add is_open_for_contribution column to words table.
+Add is_open_for_contribution column to words table in production database.
 
-This adds the word gating feature to existing Railway databases.
-Run this once on Railway to enable admin control of which words users can contribute to.
+This migration adds the word gating feature by adding a boolean column
+that controls which words are shown to contributors.
 """
 
 import os
-import sys
 from sqlalchemy import create_engine, text
 
-def add_word_gating_column():
-    """Add is_open_for_contribution column to words table if it doesn't exist"""
+# Get database URL from environment
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-    # Get database URL from environment
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        print("ERROR: DATABASE_URL environment variable not set")
-        sys.exit(1)
+if not DATABASE_URL:
+    print("❌ ERROR: DATABASE_URL environment variable not set")
+    exit(1)
 
-    print(f"Connecting to database...")
-    engine = create_engine(database_url)
+print(f"🔗 Connecting to database...")
+engine = create_engine(DATABASE_URL)
 
-    try:
-        with engine.connect() as conn:
-            # Check if column already exists
-            result = conn.execute(text("""
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name='words'
-                AND column_name='is_open_for_contribution'
-            """))
+try:
+    with engine.connect() as connection:
+        # Check if column already exists
+        result = connection.execute(text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name='words' AND column_name='is_open_for_contribution'
+        """))
 
-            if result.fetchone():
-                print("✓ Column 'is_open_for_contribution' already exists. No migration needed.")
-                return
+        if result.fetchone():
+            print("✅ Column 'is_open_for_contribution' already exists!")
+        else:
+            print("📝 Adding 'is_open_for_contribution' column...")
 
-            print("Adding 'is_open_for_contribution' column to words table...")
-
-            # Add the column (default FALSE - all words closed by default)
-            conn.execute(text("""
+            # Add the column with default value TRUE (all words open by default)
+            connection.execute(text("""
                 ALTER TABLE words
-                ADD COLUMN is_open_for_contribution BOOLEAN DEFAULT FALSE NOT NULL
+                ADD COLUMN is_open_for_contribution BOOLEAN DEFAULT TRUE NOT NULL
             """))
-            conn.commit()
 
-            print("✓ Successfully added 'is_open_for_contribution' column")
-            print("  All words are now closed by default (is_open_for_contribution = FALSE)")
-            print("  Admins can open specific words via the /ama dashboard")
+            connection.commit()
+            print("✅ Column added successfully!")
+            print("📊 All existing words are now open for contribution by default")
 
-    except Exception as e:
-        print(f"ERROR: Migration failed: {e}")
-        sys.exit(1)
-    finally:
-        engine.dispose()
+except Exception as e:
+    print(f"❌ ERROR: {e}")
+    exit(1)
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Word Gating Migration")
-    print("=" * 60)
-    add_word_gating_column()
-    print("=" * 60)
-    print("Migration complete!")
-    print("=" * 60)
+print("🎉 Migration completed!")

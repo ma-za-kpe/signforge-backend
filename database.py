@@ -25,6 +25,7 @@ class Word(Base):
     is_complete = Column(Boolean, default=False)
     trained_model_path = Column(String(500), nullable=True)
     quality_score = Column(Float, nullable=True)
+    is_open_for_contribution = Column(Boolean, default=True, nullable=False)
 
     # Sign classification metadata (crowdsourced)
     static_votes = Column(Integer, default=0)
@@ -62,6 +63,42 @@ class Contribution(Base):
     improvement_trend = Column(String(100), nullable=True)  # "Consistently improving", etc.
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ReferenceSkeleton(Base):
+    """SignTalk-GH reference skeleton data model"""
+    __tablename__ = "reference_skeletons"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Video identification
+    video_filename = Column(String(100), unique=True, index=True, nullable=False)  # e.g., "1000A.mp4"
+    sentence_id = Column(Integer, index=True, nullable=False)  # e.g., 1000
+    variation = Column(String(1), index=True, nullable=False)  # e.g., "A", "B", "D"
+
+    # Metadata from Metadata.xlsx
+    sentence_text = Column(Text, nullable=False)  # "Where is the hospital entrance?"
+    category = Column(String(100), index=True, nullable=False)  # "General hospital interactions"
+
+    # Video processing metadata
+    fps = Column(Float, nullable=False)
+    total_frames = Column(Integer, nullable=False)
+    extracted_frames = Column(Integer, nullable=False)
+    duration = Column(Float, nullable=True)  # calculated from extracted_frames/fps
+
+    # Pose data (JSON for efficient storage and queries)
+    pose_sequence = Column(JSON, nullable=False)  # Array of frames with 75 landmarks each
+
+    # Quality metrics
+    pose_quality_score = Column(Float, nullable=True)  # Average visibility across all frames
+    hand_visibility_score = Column(Float, nullable=True)  # % of frames with both hands visible
+
+    # Processing metadata
+    processed_at = Column(DateTime, default=datetime.utcnow)
+    file_size_bytes = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 def get_db():

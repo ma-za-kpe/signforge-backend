@@ -1,0 +1,35 @@
+{
+  "PAIN": {
+    "source": "kaggle_signtalk",
+    "sentence_id": 161,
+    "sentence_text": "I\u2019m in severe pain.",
+    "videos": [
+      "data/signtalk-gsl/SignTalk-GH/Videos/1610A.mp4",
+      "data/signtalk-gsl/SignTalk-GH/Videos/1610C.mp4",
+      "data/signtalk-gsl/SignTalk-GH/Videos/1610E.mp4"
+    ],
+    "count": 3
+  },
+  "FEVER": {
+    "source": "kaggle_signtalk",
+    "sentence_id": 214,
+    "sentence_text": "Do you have a fever?",
+    "videos": [
+      "data/signtalk-gsl/SignTalk-GH/Videos/2140B.mp4",
+      "data/signtalk-gsl/SignTalk-GH/Videos/2140E.mp4",
+      "data/signtalk-gsl/SignTalk-GH/Videos/2141B.mp4"
+    ],
+    "count": 3
+  },
+  "DOCTOR": {
+    "source": "kaggle_signtalk",
+    "sentence_id": 4,
+    "sentence_text": "Do I need an appointment to see the doctor?",
+    "videos": [
+      "data/signtalk-gsl/SignTalk-GH/Videos/4000A.mp4",
+      "data/signtalk-gsl/SignTalk-GH/Videos/4000C.mp4",
+      "data/signtalk-gsl/SignTalk-GH/Videos/4001C.mp4"
+    ],
+    "count": 3
+  }
+}

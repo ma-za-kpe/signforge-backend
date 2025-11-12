@@ -57,3 +57,5 @@ asl_lex_signdata.csv
 # OS
 .DS_Store
 Thumbs.db
+
+data
